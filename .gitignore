@@ -9,3 +9,7 @@ __pycache__/
 .idea/
 .vscode/
 .pytest_cache/
+# temporary files
+_probe.py
+_fetch_log.py
+*.png

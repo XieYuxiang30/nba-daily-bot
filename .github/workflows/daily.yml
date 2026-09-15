@@ -28,3 +28,10 @@ jobs:
           TZ: Asia/Shanghai
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
         run: python main.py
+
+      # 抓取失败时，自动打印各数据源的检测结果，方便定位是哪个源不通
+      - name: Diagnose data sources
+        if: failure()
+        env:
+          TZ: Asia/Shanghai
+        run: python main.py --diagnose || true
