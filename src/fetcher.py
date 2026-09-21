@@ -2,9 +2,9 @@
 
 数据源（按 ``auto`` 顺序尝试）：
 
-1. ``nba_api``：NBA 官方 stats 接口（ScoreboardV3 → ScoreboardV2）
-2. ``espn``：ESPN 公开 JSON 接口
-3. ``nba_cdn``：NBA 官网 CDN 的当日记分牌 JSON（仅限当天）
+1. ``espn``：ESPN 公开 JSON 接口（多域名 + 多请求头轮换）
+2. ``nba_cdn``：NBA 官网 CDN 的当日记分牌 JSON（仅限当天）
+3. ``nba_api``：NBA 官方 stats 接口（ScoreboardV3 → ScoreboardV2）
 
 不同数据源结构各异，这里统一转换成「标准化比赛字典」后再交给
 :mod:`formatter` 处理，避免上层逻辑与数据源耦合。
@@ -33,17 +33,34 @@ except Exception:  # pragma: no cover - 仅在缺少依赖时触发
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 EASTERN_TZ = ZoneInfo("America/New_York")
 
-ESPN_SCOREBOARD_URL = (
-    "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
-)
+ESPN_SCOREBOARD_URLS = [
+    "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
+    "https://site.web.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
+]
 NBA_CDN_SCOREBOARD_URL = (
     "https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json"
 )
 
-HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json, text/plain, */*",
-}
+#: 不同的 CDN/Akamai 对 UA 的拦截策略因 IP 而异（GitHub Actions 的机房 IP
+#: 用简写 UA 会 403），因此依次尝试多组请求头，任意一组成功即返回。
+HTTP_HEADER_PROFILES = [
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+    },
+    {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/plain, */*",
+    },
+    {
+        "User-Agent": "curl/8.5.0",
+        "Accept": "application/json",
+    },
+]
 
 NBA_API_TIMEOUT = 12  # 官方接口在部分网络下会超时，控制单次等待时间
 HTTP_CONNECT_TIMEOUT = 8
@@ -152,37 +169,50 @@ def _sort_games(games: List[Game]) -> List[Game]:
 
 
 def _http_get_json(
-    url: str,
+    urls: str | List[str],
     params: Optional[Dict[str, Any]] = None,
     retries: int = HTTP_RETRIES,
 ) -> Any:
-    """带重试的 JSON GET 请求，失败时抛出带状态码的 :class:`FetchError`。"""
-    last_error = ""
-    for attempt in range(retries + 1):
-        try:
-            response = requests.get(
-                url,
-                params=params,
-                headers=HTTP_HEADERS,
-                timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT),
-            )
-        except Exception as exc:  # noqa: BLE001 - 网络异常统一处理
-            last_error = f"{type(exc).__name__}: {exc}"
-        else:
-            if response.status_code == 200:
+    """依次尝试多个 URL × 多组请求头，任意组合成功即返回 JSON。
+
+    机房 IP 下部分 CDN 会按 UA 拦截（403），单靠一种请求头不可靠。
+    第一组请求头带完整重试，其余组合各试一次，控制总耗时。
+    """
+    if isinstance(urls, str):
+        urls = [urls]
+    errors: List[str] = []
+    for url in urls:
+        for profile_index, headers in enumerate(HTTP_HEADER_PROFILES):
+            attempts = retries + 1 if profile_index == 0 else 1
+            last_error = ""
+            for attempt in range(attempts):
                 try:
-                    return response.json()
-                except ValueError as exc:
-                    last_error = (
-                        f"返回内容不是 JSON（{exc}）：{response.text[:120]!r}"
+                    response = requests.get(
+                        url,
+                        params=params,
+                        headers=headers,
+                        timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT),
                     )
-            else:
-                last_error = (
-                    f"HTTP {response.status_code}：{response.text[:120]!r}"
-                )
-        if attempt < retries:
-            time.sleep(1.5 * (attempt + 1))
-    raise FetchError(last_error or "请求失败")
+                except Exception as exc:  # noqa: BLE001 - 网络异常统一处理
+                    last_error = f"{type(exc).__name__}: {exc}"
+                else:
+                    if response.status_code == 200:
+                        try:
+                            return response.json()
+                        except ValueError as exc:
+                            last_error = (
+                                f"返回内容不是 JSON（{exc}）：{response.text[:120]!r}"
+                            )
+                    else:
+                        last_error = (
+                            f"HTTP {response.status_code}：{response.text[:120]!r}"
+                        )
+                        if response.status_code == 403:
+                            break  # 该组请求头被拦截，直接换下一组
+                if attempt < attempts - 1:
+                    time.sleep(1.5 * (attempt + 1))
+            errors.append(f"{url.split('/')[2]}[UA{profile_index}] {last_error}")
+    raise FetchError(" | ".join(errors) or "请求失败")
 
 
 # ---------------------------------------------------------------------------
@@ -395,7 +425,7 @@ _ESPN_STATE_TO_STATUS = {
 def fetch_from_espn(date_str: str) -> List[Game]:
     """通过 ESPN 公开接口获取指定日期（美东日期）的比赛。"""
     payload = _http_get_json(
-        ESPN_SCOREBOARD_URL, params={"dates": date_str.replace("-", "")}
+        ESPN_SCOREBOARD_URLS, params={"dates": date_str.replace("-", "")}
     )
 
     games: List[Game] = []
@@ -491,7 +521,8 @@ SOURCES: Dict[str, Tuple[str, Callable[[str], List[Game]]]] = {
     "nba_cdn": ("NBA官网CDN", fetch_from_nba_cdn),
 }
 
-SOURCE_ORDER = ["nba_api", "espn", "nba_cdn"]
+# ESPN 在机房/家用网络下都最稳定；官方 stats 接口在两端经常超时，放最后
+SOURCE_ORDER = ["espn", "nba_cdn", "nba_api"]
 
 
 def today_str() -> str:
